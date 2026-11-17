@@ -1,0 +1,112 @@
+name: Deploy QLHVK1
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: qlhvk1-production
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    name: Kiểm tra thay đổi trước khi SSH
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.check.outputs.deploy }}
+      app: ${{ steps.check.outputs.app }}
+      nginx: ${{ steps.check.outputs.nginx }}
+      compose: ${{ steps.check.outputs.compose }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: So với workflow thành công gần nhất trên main
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Không so riêng commit trước: deploy lỗi hoặc commit bị gộp hàng đợi vẫn được xét lại.
+          previous=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // empty')
+          app=false
+          nginx=false
+          compose=false
+          if [[ -z "$previous" ]] || ! git cat-file -e "$previous^{commit}" 2>/dev/null; then
+            app=true; nginx=true; compose=true
+          else
+            while IFS= read -r file; do
+              case "$file" in
+                deploy/nginx/*) nginx=true ;;
+                docker-compose.yml) compose=true ;;
+                src/*|Dockerfile|.dockerignore|deploy/scripts/*|deploy/seed/*|.github/workflows/deploy.yml)
+                  app=true ;;
+              esac
+            done < <(git diff --name-only "$previous" "$GITHUB_SHA")
+          fi
+          # Chạy tay dùng để triển khai lại; script vẫn giữ cấu hình Nginx/Compose không đổi.
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then app=true; fi
+          deploy=false
+          if [[ "$app" == true || "$nginx" == true || "$compose" == true ]]; then deploy=true; fi
+          printf 'deploy=%s\napp=%s\nnginx=%s\ncompose=%s\n' "$deploy" "$app" "$nginx" "$compose" >> "$GITHUB_OUTPUT"
+          printf 'Ứng dụng: %s | Nginx: %s | Compose: %s | SSH deploy: %s\n' "$app" "$nginx" "$compose" "$deploy"
+
+  deploy:
+    name: CD lên server root
+    needs: changes
+    if: needs.changes.outputs.deploy == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Truyền mã nguồn và triển khai
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          INITIAL_DATA_KEY: ${{ secrets.INITIAL_DATA_KEY }}
+          APP_CHANGED: ${{ needs.changes.outputs.app }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          : "${SSH_HOST:?Thiếu SSH_HOST}"
+          : "${SSH_PRIVATE_KEY:?Thiếu SSH_PRIVATE_KEY}"
+          : "${SSH_KNOWN_HOSTS:?Thiếu SSH_KNOWN_HOSTS}"
+          port=${SSH_PORT:-22}
+          [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || { echo "SSH_HOST phải là IPv4 hoặc hostname."; exit 1; }
+          [[ "$port" =~ ^[0-9]+$ && ${#port} -le 5 ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
+          deploy_id="$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          remote="/opt/qlhvk1/incoming/$deploy_id"
+          temp=$(mktemp -d)
+          trap 'rm -rf "$temp"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$temp/id"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$temp/known_hosts"
+          printf '%s' "$INITIAL_DATA_KEY" > "$temp/seed.key"
+          # git archive chỉ lấy source đã commit, không lấy secret hoặc file tạm của runner.
+          git archive --format=tar.gz HEAD > "$temp/source.tar.gz"
+          options=(-i "$temp/id" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$temp/known_hosts" -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
+          ssh "${options[@]}" -p "$port" "root@$SSH_HOST" "umask 077; mkdir -p '$remote'; chmod 700 /opt/qlhvk1 '$remote'"
+          scp "${options[@]}" -P "$port" "$temp/source.tar.gz" "$temp/seed.key" "root@$SSH_HOST:$remote/"
+          ssh "${options[@]}" -p "$port" "root@$SSH_HOST" \
+            "bash -s -- '$deploy_id' '$APP_CHANGED'" <<'REMOTE'
+          set -Eeuo pipefail
+          umask 077
+          deploy_id=$1
+          app_changed=$2
+          [[ "$deploy_id" =~ ^[a-f0-9]{40}-[0-9]+-[0-9]+$ ]] || exit 1
+          incoming="/opt/qlhvk1/incoming/$deploy_id"
+          release="/opt/qlhvk1/releases/$deploy_id"
+          trap 'rm -rf "$incoming"' EXIT
+          mkdir -p "$release"
+          tar -xzf "$incoming/source.tar.gz" -C "$release"
+          bash "$release/deploy/scripts/deploy.sh" "$app_changed" "$incoming/seed.key"
+          REMOTE

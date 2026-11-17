@@ -1,0 +1,14 @@
+**/bin/
+**/obj/
+**/AppData/
+.vs/
+*.user
+*.suo
+.env
+KHONG_UPLOAD/
+**/INITIAL_DATA_KEY.txt
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
