@@ -14,8 +14,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ---------------------------------------------------------------
+  # JOB 1: Kiểm tra code thay đổi gì so với lần deploy thành công gần nhất
+  # ---------------------------------------------------------------
   changes:
-    name: Kiểm tra thay đổi trước khi SSH
+    name: Kiểm tra thay đổi
     runs-on: ubuntu-latest
     outputs:
       deploy: ${{ steps.check.outputs.deploy }}
@@ -23,10 +26,12 @@ jobs:
       nginx: ${{ steps.check.outputs.nginx }}
       compose: ${{ steps.check.outputs.compose }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Lấy mã nguồn (đủ lịch sử để so sánh)
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: So với workflow thành công gần nhất trên main
+
+      - name: So sánh với lần chạy thành công gần nhất trên main
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
@@ -34,70 +39,126 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Không so riêng commit trước: deploy lỗi hoặc commit bị gộp hàng đợi vẫn được xét lại.
-          previous=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // empty')
+
+          # So với lần chạy thành công gần nhất (không phải commit liền trước),
+          # nên deploy lỗi hoặc commit bị gộp hàng đợi vẫn được xét lại.
+          previous=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/runs?branch=main&status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha // empty')
+
           app=false
           nginx=false
           compose=false
+
           if [[ -z "$previous" ]] || ! git cat-file -e "$previous^{commit}" 2>/dev/null; then
+            # Chưa có lần nào thành công -> deploy toàn bộ
             app=true; nginx=true; compose=true
           else
             while IFS= read -r file; do
               case "$file" in
-                deploy/nginx/*) nginx=true ;;
+                deploy/nginx/*)  nginx=true ;;
                 docker-compose.yml) compose=true ;;
                 src/*|Dockerfile|.dockerignore|deploy/scripts/*|deploy/seed/*|.github/workflows/deploy.yml)
                   app=true ;;
               esac
             done < <(git diff --name-only "$previous" "$GITHUB_SHA")
           fi
-          # Chạy tay dùng để triển khai lại; script vẫn giữ cấu hình Nginx/Compose không đổi.
+
+          # Chạy tay = muốn triển khai lại ứng dụng
           if [[ "$EVENT_NAME" == workflow_dispatch ]]; then app=true; fi
+
           deploy=false
           if [[ "$app" == true || "$nginx" == true || "$compose" == true ]]; then deploy=true; fi
-          printf 'deploy=%s\napp=%s\nnginx=%s\ncompose=%s\n' "$deploy" "$app" "$nginx" "$compose" >> "$GITHUB_OUTPUT"
-          printf 'Ứng dụng: %s | Nginx: %s | Compose: %s | SSH deploy: %s\n' "$app" "$nginx" "$compose" "$deploy"
 
+          {
+            echo "deploy=$deploy"
+            echo "app=$app"
+            echo "nginx=$nginx"
+            echo "compose=$compose"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Ứng dụng: $app | Nginx: $nginx | Compose: $compose | Cần deploy: $deploy"
+
+  # ---------------------------------------------------------------
+  # JOB 2: Deploy lên server + gắn chứng chỉ SSL
+  # ---------------------------------------------------------------
   deploy:
-    name: CD lên server root
+    name: Deploy lên server
     needs: changes
     if: needs.changes.outputs.deploy == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - name: Truyền mã nguồn và triển khai
+      - name: Lấy mã nguồn
+        uses: actions/checkout@v4
+
+      # Bước 1: chuẩn bị SSH. Host key được lấy trực tiếp từ server (ssh-keyscan),
+      # không cần secret SSH_KNOWN_HOSTS.
+      - name: Chuẩn bị kết nối SSH
         env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          : "${SERVER_HOST:?Thiếu secret SERVER_HOST}"
+          : "${SERVER_USER:?Thiếu secret SERVER_USER}"
+          : "${SSH_PRIVATE_KEY:?Thiếu secret SSH_PRIVATE_KEY}"
+
+          [[ "$SERVER_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] \
+            || { echo "::error::SERVER_HOST chỉ được là IP hoặc hostname, không kèm user@ hay khoảng trắng"; exit 1; }
+          [[ "$SERVER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+            || { echo "::error::SERVER_USER không hợp lệ"; exit 1; }
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+
+          ssh-keyscan -T 15 -t ed25519,rsa "$SERVER_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          [[ -s ~/.ssh/known_hosts ]] \
+            || { echo "::error::Không lấy được host key từ $SERVER_HOST (sai IP, firewall chặn cổng 22, hoặc server tắt)"; exit 1; }
+
+          cat > ~/.ssh/config <<EOF
+          Host server
+            HostName ${SERVER_HOST}
+            User ${SERVER_USER}
+            Port 22
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ServerAliveInterval 30
+            ServerAliveCountMax 10
+          EOF
+
+          ssh server 'echo "Kết nối SSH thành công: $(hostname)"'
+
+      # Bước 2: đóng gói source đã commit, gửi lên server và chạy deploy.sh
+      - name: Gửi mã nguồn và triển khai
+        env:
           INITIAL_DATA_KEY: ${{ secrets.INITIAL_DATA_KEY }}
           APP_CHANGED: ${{ needs.changes.outputs.app }}
         shell: bash
         run: |
           set -Eeuo pipefail
           umask 077
-          : "${SSH_HOST:?Thiếu SSH_HOST}"
-          : "${SSH_PRIVATE_KEY:?Thiếu SSH_PRIVATE_KEY}"
-          : "${SSH_KNOWN_HOSTS:?Thiếu SSH_KNOWN_HOSTS}"
-          port=${SSH_PORT:-22}
-          [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || { echo "SSH_HOST phải là IPv4 hoặc hostname."; exit 1; }
-          [[ "$port" =~ ^[0-9]+$ && ${#port} -le 5 ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
-          deploy_id="$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          remote="/opt/qlhvk1/incoming/$deploy_id"
+
+          deploy_id="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          remote="/opt/qlhvk1/incoming/${deploy_id}"
+
           temp=$(mktemp -d)
           trap 'rm -rf "$temp"' EXIT
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$temp/id"
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$temp/known_hosts"
+
           printf '%s' "$INITIAL_DATA_KEY" > "$temp/seed.key"
-          # git archive chỉ lấy source đã commit, không lấy secret hoặc file tạm của runner.
+          # git archive chỉ lấy file đã commit, không lấy secret hay file tạm của runner
           git archive --format=tar.gz HEAD > "$temp/source.tar.gz"
-          options=(-i "$temp/id" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$temp/known_hosts" -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
-          ssh "${options[@]}" -p "$port" "root@$SSH_HOST" "umask 077; mkdir -p '$remote'; chmod 700 /opt/qlhvk1 '$remote'"
-          scp "${options[@]}" -P "$port" "$temp/source.tar.gz" "$temp/seed.key" "root@$SSH_HOST:$remote/"
-          ssh "${options[@]}" -p "$port" "root@$SSH_HOST" \
-            "bash -s -- '$deploy_id' '$APP_CHANGED'" <<'REMOTE'
+
+          ssh server "umask 077; mkdir -p '$remote'; chmod 700 /opt/qlhvk1 '$remote'"
+          scp "$temp/source.tar.gz" "$temp/seed.key" "server:$remote/"
+
+          ssh server "bash -s -- '$deploy_id' '$APP_CHANGED'" <<'REMOTE'
           set -Eeuo pipefail
           umask 077
           deploy_id=$1
@@ -109,4 +170,51 @@ jobs:
           mkdir -p "$release"
           tar -xzf "$incoming/source.tar.gz" -C "$release"
           bash "$release/deploy/scripts/deploy.sh" "$app_changed" "$incoming/seed.key"
+          REMOTE
+
+      # Bước 3: chứng chỉ SSL bằng certbot --nginx (xin và tự gắn vào Nginx).
+      # Chạy khi cấu hình Nginx vừa đổi (deploy có thể ghi đè phần SSL cũ)
+      # hoặc khi domain chưa có chứng chỉ.
+      - name: Xin và gắn chứng chỉ SSL (certbot --nginx)
+        env:
+          DOMAIN: ${{ secrets.DOMAIN }}
+          CERTBOT_EMAIL: ${{ secrets.CERTBOT_EMAIL }}
+          NGINX_CHANGED: ${{ needs.changes.outputs.nginx }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          : "${DOMAIN:?Thiếu secret DOMAIN}"
+          : "${CERTBOT_EMAIL:?Thiếu secret CERTBOT_EMAIL}"
+          [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] \
+            || { echo "::error::DOMAIN không hợp lệ"; exit 1; }
+          [[ "$CERTBOT_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]] \
+            || { echo "::error::CERTBOT_EMAIL không hợp lệ"; exit 1; }
+
+          ssh server "bash -s -- '$DOMAIN' '$CERTBOT_EMAIL' '$NGINX_CHANGED'" <<'REMOTE'
+          set -Eeuo pipefail
+          domain=$1
+          email=$2
+          nginx_changed=$3
+
+          if ! command -v certbot >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y
+            apt-get install -y certbot python3-certbot-nginx
+          fi
+
+          if [[ "$nginx_changed" == true || ! -d "/etc/letsencrypt/live/$domain" ]]; then
+            nginx -t
+            certbot --nginx \
+              -d "$domain" \
+              -m "$email" \
+              --agree-tos --no-eff-email \
+              --non-interactive \
+              --redirect \
+              --keep-until-expiring
+            nginx -t
+            systemctl reload nginx
+          else
+            echo "Chứng chỉ của $domain đã có và Nginx không đổi, bỏ qua certbot."
+          fi
           REMOTE
