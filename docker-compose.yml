@@ -10,7 +10,7 @@ services:
       - "127.0.0.1:8989:8989"
     environment:
       AllowedHosts: "qlhvk1.hoanganhplus01.io.vn;localhost;127.0.0.1"
-      Deployment__NginxProxyIp: "172.28.89.1"
+      Deployment__NginxProxyIp: "10.250.89.1"
       Deployment__RequireInitializedData: "true"
     volumes:
       - type: bind
@@ -33,5 +33,5 @@ networks:
   default:
     ipam:
       config:
-        - subnet: "172.28.89.0/24"
-          gateway: "172.28.89.1"
+        - subnet: "10.250.89.0/24"
+          gateway: "10.250.89.1"
