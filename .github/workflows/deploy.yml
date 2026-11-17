@@ -107,6 +107,10 @@ jobs:
           : "${SERVER_USER:?Thiếu secret SERVER_USER}"
           : "${SSH_PRIVATE_KEY:?Thiếu secret SSH_PRIVATE_KEY}"
 
+          # Cắt dấu cách, xuống dòng, ký tự thừa khi dán secret
+          SERVER_HOST=$(printf '%s' "$SERVER_HOST" | tr -d '[:space:]')
+          SERVER_USER=$(printf '%s' "$SERVER_USER" | tr -d '[:space:]')
+
           [[ "$SERVER_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] \
             || { echo "::error::SERVER_HOST chỉ được là IP hoặc hostname, không kèm user@ hay khoảng trắng"; exit 1; }
           [[ "$SERVER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] \
@@ -186,6 +190,9 @@ jobs:
 
           : "${DOMAIN:?Thiếu secret DOMAIN}"
           : "${CERTBOT_EMAIL:?Thiếu secret CERTBOT_EMAIL}"
+          # Cắt dấu cách, xuống dòng, ký tự thừa khi dán secret
+          DOMAIN=$(printf '%s' "$DOMAIN" | tr -d '[:space:]')
+          CERTBOT_EMAIL=$(printf '%s' "$CERTBOT_EMAIL" | tr -d '[:space:]')
           [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] \
             || { echo "::error::DOMAIN không hợp lệ"; exit 1; }
           [[ "$CERTBOT_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]] \
